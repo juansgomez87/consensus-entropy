@@ -61,7 +61,7 @@ You can perform all experiments using the following command:
 python3 amg_test.py -q 10 -e 10 -m rand -n 150 && sleep 200 && python3 amg_test.py -q 10 -e 10 -m mc -n 150 && sleep 200 && python3 amg_test.py -q 10 -e 10 -m hc -n 150 && sleep 200 && python3 amg_test.py -q 10 -e 10 -m mix -n 150
 ```
 
-All final personalized models will appear in `models/user/{user_id}` alongside a text file containing the corresponding 
+All final personalized models will appear in `models/user/{user_id}` alongside a text file containing the corresponding evaluation metrics. 
 
 ## Publication
 ```
