@@ -1,6 +1,6 @@
 # Let's agree to disagree: Consensus Entropy Active Learning for Personalized Music Emotion Recognition
 
-Implementation of active learning for our paper presented at the 22nd International Society for Music Information Retrieval Conference (ISMIR).
+Implementation of active learning for [our paper]() ([supplementary material]()) presented at the 22nd International Society for Music Information Retrieval Conference (ISMIR).
 -- Juan Sebastián Gómez-Cañón, Estefanía Cano, Yi-Hsuan Yang, Perfecto Herrera, and Emilia Gómez
 
 ## Abstract
