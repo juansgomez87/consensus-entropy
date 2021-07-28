@@ -1,6 +1,7 @@
 # Let's agree to disagree: Consensus Entropy Active Learning for Personalized Music Emotion Recognition
 
-Implementation of active learning for [our paper]() ([supplementary material]()) presented at the 22nd International Society for Music Information Retrieval Conference (ISMIR).
+Source code implementation of active learning for [our paper](https://github.com/juansgomez87/consensus-entropy/blob/main/paper/ISMIR2021_JSGC_ActiveLearning.pdf) (also the [suppl. material](https://github.com/juansgomez87/consensus-entropy/blob/main/paper/ISMIR2021_JSGC_ActiveLearning_supp_mat.pdf)) presented at the 22nd International Society for Music Information Retrieval Conference (ISMIR).
+
 -- Juan Sebastián Gómez-Cañón, Estefanía Cano, Yi-Hsuan Yang, Perfecto Herrera, and Emilia Gómez
 
 ## Abstract
@@ -26,16 +27,41 @@ cp xgboost/sklearn.py ./cons-env/lib/python3.8/site-packages/xgboost/
 ```
 We also use [short-chunk CNN](https://github.com/minzwon/sota-music-tagging-models/) proposed by Won et al. Thank you to the authors!
 
-*Note:* Since 
-
 ## Data
 
-The DEAM dataset is available in [this link](https://cvml.unige.ch/databases/DEAM/). 
+*Note:* The configuration file `settings.py` contains all the directories necessary for the code. Please update the strings `deam_data` and `amg_data` accordingly.
 
+The DEAM dataset is available in [this link](https://cvml.unige.ch/databases/DEAM/). We already provide discretized annotations in the `deam_annotations` directory. 
+
+*To be completed with access to data!* 
 
 
 ## Usage
 
+### Pre-trained models
+You can find the pre-trained models on the DEAM dataset in the `models/pretrained` directory.
+
+Models can also be pre-trained using the following command (-cv is the cross-validation split and -m is the classifier algorithm to be used):
+```
+python3 deam_classifier.py -cv CVAL_SPLIT -m MODEL_TYPE
+```
+Our experiments were ran with CVAL_SPLIT=5 and MODEL_TYPE=[gnb, sgd, xgb, cnn].
+
+### Personalization
+In order to perform all the experiments, we use the `amg_test.py` script. There are four different input flags:
+```
+--queries: We used q=10 for each iteration.
+--epochs: We used e=10 iterations.
+--num_anno: We used only annotations from users that annotated over 150 excerpts.
+--mode: mc - machine consensus, hc - human consensus, mix - hybrid consensus, and rand - random baseline.
+```
+
+You can perform all experiments using the following command:
+```
+python3 amg_test.py -q 10 -e 10 -m rand -n 150 && sleep 200 && python3 amg_test.py -q 10 -e 10 -m mc -n 150 && sleep 200 && python3 amg_test.py -q 10 -e 10 -m hc -n 150 && sleep 200 && python3 amg_test.py -q 10 -e 10 -m mix -n 150
+```
+
+All final personalized models will appear in `models/user/{user_id}` alongside a text file containing the corresponding 
 
 ## Publication
 ```

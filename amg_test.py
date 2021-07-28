@@ -3,7 +3,7 @@
 Emotion algorithm to test active learning on AMG1608 dataset.
 
 Copyright 2021, J.S. Gómez-Cañón
-Licensed under ???
+Licensed under GNU AFFERO GENERAL PUBLIC LICENSE
 """
 
 import argparse
@@ -28,6 +28,12 @@ import xgboost as xgb
 import warnings
 from scipy.io import loadmat
 warnings.filterwarnings("ignore")
+
+import torch
+from torch.utils import tensorboard
+import time
+import datetime
+from short_cnn import ShortChunkCNN, get_audio_loader
 
 from settings import *
 
@@ -72,7 +78,7 @@ class AMG_Tester():
         return quad
 
     def load_models(self, user_path):
-        mod_list = [os.path.join(root, f) for root, dirs, files in os.walk(user_path) for f in files if f.lower().endswith('.pkl')]
+        mod_list = [os.path.join(root, f) for root, dirs, files in os.walk(user_path) for f in files if (f.lower().endswith('.pkl') or f.lower().endswith('.pth'))]
         if len(mod_list) == 0:
             print('No pre-trained models of this type!')
             sys.exit(0)
@@ -142,23 +148,205 @@ class AMG_Tester():
         path_models_pre = os.path.join(p_mod, 'pretrained')
         path_models_users = os.path.join(p_mod, 'users')
         user_path = os.path.join(path_models_users, str(user), self.mode)
+        skip_user = False
         try:
             os.makedirs(user_path)
+
         except FileExistsError:
-            subprocess.run(['rm', '-rf', user_path])
-            os.makedirs(user_path)
+            print('Skipping user {}, already exists!'.format(user))
+            skip_user = True
+            # subprocess.run(['rm', '-rf', user_path])
+            # os.makedirs(user_path)
+            
 
-        pre_models = [os.path.join(root, f) for root, dirs, files in os.walk(path_models_pre) for f in files if f.lower().endswith('.pkl')]
-        cp_models = [f.replace(path_models_pre, user_path) for f in pre_models]
+        if os.path.exists(user_path) and skip_user is False:
+            pre_models = [os.path.join(root, f) for root, dirs, files in os.walk(path_models_pre) for f in files if (f.lower().endswith('.pkl') or f.lower().endswith('.pth'))]
+            cp_models = [f.replace(path_models_pre, user_path) for f in pre_models]
 
-        for in_f, out_f in zip(pre_models, cp_models):
-            shutil.copy(in_f, out_f)
-        return user_path
+            for in_f, out_f in zip(pre_models, cp_models):
+                shutil.copy(in_f, out_f)
+
+
+
+        return user_path, skip_user
+
+    def predict_cnn(self, mod_fn, loader):
+        mod = ShortChunkCNN()
+        state = torch.load(mod_fn, map_location=torch.device('cuda'))
+        mod.spec.mel_scale.fb = state['spec.mel_scale.fb']
+        mod.load_state_dict(state)
+        mod.eval()
+
+        if torch.cuda.is_available():
+            mod.cuda()
+        
+        est_array = []
+        gt_array = []
+        for x, y in loader:
+            # Forward
+            if torch.cuda.is_available():
+                x = x.cuda()
+                y = y.cuda()
+            x = torch.autograd.Variable(x)
+            y = torch.autograd.Variable(y)
+            out = mod(x)
+            out = out.detach().cpu()
+
+            # estimate
+            estimated = np.array(out).mean(axis=0)
+            est_array.append(estimated)
+            gt_array.append(np.mean(y.detach().cpu().numpy(), axis=0))
+        est_array, gt_array = np.array(est_array), np.array(gt_array)
+
+        return est_array, gt_array
+
+    def opt_schedule(self, model, mod_fn, current_optimizer, drop_counter, opt):
+        # adam to sgd
+        if current_optimizer == 'adam' and drop_counter == 20:
+            state = torch.load(mod_fn)
+            model.load_state_dict(state)
+            opt = torch.optim.SGD(model.parameters(), 0.001,
+                                  momentum=0.9, weight_decay=0.0001,
+                                  nesterov=True)
+            current_optimizer = 'sgd_1'
+            drop_counter = 0
+            # print('sgd 1e-3')
+        # first drop
+        if current_optimizer == 'sgd_1' and drop_counter == 20:
+            state = torch.load(mod_fn)
+            model.load_state_dict(state)
+            for pg in opt.param_groups:
+                pg['lr'] = 0.0001
+            current_optimizer = 'sgd_2'
+            drop_counter = 0
+            # print('sgd 1e-4')
+        # second drop
+        if current_optimizer == 'sgd_2' and drop_counter == 20:
+            state = torch.load(mod_fn)
+            model.load_state_dict(state)
+            for pg in opt.param_groups:
+                pg['lr'] = 0.00001
+            current_optimizer = 'sgd_3'
+            # print('sgd 1e-5')
+        return current_optimizer, drop_counter, opt
+
+    def validation(self, model, epoch, loss, loader, best_metric, mod_fn):
+        model = model.eval()
+        est_array = []
+        gt_array = []
+        losses = []
+        reconst_loss = loss
+
+        for x, y in loader:
+            # Forward
+            if torch.cuda.is_available():
+                x = x.cuda()
+                y = y.cuda()
+            x = torch.autograd.Variable(x)
+            y = torch.autograd.Variable(y)
+
+            out = model(x)
+
+            # Backward
+            loss = reconst_loss(out, y)
+            losses.append(float(loss.data))
+            out = out.detach().cpu()
+
+            # estimate
+            estimated = np.array(out).mean(axis=0)
+            est_array.append(estimated)
+            gt_array.append(np.mean(y.detach().cpu().numpy(), axis=0))
+
+        est_array, gt_array = np.array(est_array), np.array(gt_array)
+        loss_mean = np.mean(losses)
+        
+
+        f1_sc = f1_score(np.argmax(gt_array, axis=1), np.argmax(est_array, axis=1), average='weighted')
+        # print('f1_score: %.4f' % f1_sc)
+
+        score = 1 - loss_mean
+        if score > best_metric:
+            # print('best model!')
+            # print('loss validation: %.4f' % loss_mean)
+            # print('f1_score: %.4f' % f1_sc)
+            best_metric = score
+            torch.save(model.state_dict(), mod_fn)
+        return f1_sc, loss_mean, best_metric
+
+    def retrain_cnn(self, mod_fn, id_tr, test_loader):
+        model = ShortChunkCNN()
+        state = torch.load(mod_fn, map_location=torch.device('cuda'))
+        model.spec.mel_scale.fb = state['spec.mel_scale.fb']
+        model.load_state_dict(state)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+        current_optimizer = 'adam'
+
+        train_loader = get_audio_loader(amg_npy,
+                                        batch_size=batch_size,
+                                        split=id_tr,
+                                        input_length=input_length,
+                                        num_workers=1)
+
+        if torch.cuda.is_available():
+            model.cuda()
+        # start training
+        start_t = time.time()
+        loss_fun = torch.nn.BCELoss()
+        best_metric = 0
+        drop_counter = 0
+
+        for epoch in range(n_epochs_retrain):
+            ctr = 0
+            drop_counter += 1
+            model = model.train()
+            for x, y in train_loader:
+                ctr += 1
+                # Forward
+                if torch.cuda.is_available():
+                    x = x.cuda()
+                    y = y.cuda()
+                x = torch.autograd.Variable(x)
+                y = torch.autograd.Variable(y)
+
+                out = model(x)
+
+                # Backward
+                loss = loss_fun(out, y)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                # if (epoch) % 50 == 0:
+                #     print("[%s] Epoch [%d/%d] Iter [%d/%d] train loss: %.4f Elapsed: %s" %
+                #             (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                #                 epoch+1, n_epochs_cnn, ctr, len(train_loader), loss.item(),
+                #                 datetime.timedelta(seconds=time.time()-start_t)))
+
+            # validation
+            f1_sc, loss_mean, best_metric = self.validation(model,
+                                                            epoch,
+                                                            loss_fun,
+                                                            test_loader,
+                                                            best_metric,
+                                                            mod_fn)
+
+            # schedule optimizer
+            current_optimizer, drop_counter, optimizer = self.opt_schedule(model,
+                                                                           mod_fn,
+                                                                           current_optimizer,
+                                                                           drop_counter,
+                                                                           optimizer)
+            # print(current_optimizer)
+
+        est_array, gt_array = self.predict_cnn(mod_fn, test_loader)
+        return est_array, gt_array
+
 
     def run(self):
         for num_user, u_id in enumerate(self.all_users):
             # create user folder
-            user_path = self.create_user(u_id, path_models_amg)
+            user_path, skip_user = self.create_user(u_id, path_all_models)
+            if skip_user:
+                continue
             # load models
             mod_list = self.load_models(user_path)
             # get songs annotated by this user to reduce batch
@@ -167,7 +355,8 @@ class AMG_Tester():
             this_X = self.X_pool[self.X_pool.index.isin(this_song_ids)].sort_index()
             this_y = this_anno_user[['song_id', 'quadrant']].set_index('song_id').reindex(this_X.index)
             # reduce human consensus matrix to only the songs annotated by the user
-            this_consensus_hc = self.consensus_prob_hc[self.consensus_prob_hc.index.isin(this_song_ids)]
+            # this_consensus_hc = self.consensus_prob_hc[self.consensus_prob_hc.index.isin(this_song_ids)]
+            this_consensus_hc = self.consensus_prob_hc.loc[this_song_ids]
             print('Creating and performing active learning for user {} with {} annotations.'.format(u_id, this_anno_user.shape[0]))
             print('User {} / {}'.format(num_user, len(self.all_users) - 1))
             # split into train and test
@@ -176,8 +365,29 @@ class AMG_Tester():
             X_train, y_train = this_X.iloc[train_idx], this_y.iloc[train_idx]
             X_test, y_test = this_X.iloc[test_idx], this_y.iloc[test_idx]
             y_test_enc = y_test.quadrant.replace(self.dict_class)
+            # use same ids for convolutional network
+            id_tr = this_y.iloc[train_idx].groupby(['s_id']).max()
+            id_te = this_y.iloc[test_idx].groupby(['s_id']).max()
+            id_tr.index.name = 'song_id'
+            id_te.index.name ='song_id'
+            id_tr.rename(columns={'quadrant': 'quadrants'}, inplace=True)
+            id_te.rename(columns={'quadrant': 'quadrants'}, inplace=True)
+            # reduce hc consensus matrix to only train instances
+            this_consensus_hc = this_consensus_hc[this_consensus_hc.index.isin(id_tr.index)]
+            # create loaders with batch of 1 to calculate entropy and generate predictions
+            train_loader = get_audio_loader(amg_npy,
+                                            batch_size=1,
+                                            split=id_tr,
+                                            input_length=input_length,
+                                            num_workers=1)
+            test_loader = get_audio_loader(amg_npy,
+                                           batch_size=1,
+                                           split=id_te,
+                                           input_length=input_length,
+                                           num_workers=1)
+
             # store results in text files
-            day_in_time = datetime.datetime.now().strftime("%d-%m-%Y.%H:%M:%S")
+            day_in_time = datetime.datetime.now().strftime("%d-%m-%Y.%H-%M-%S")
             txt_fn = '{}.trial.date_{}.txt'.format(self.mode, day_in_time)
             txt_file = open(os.path.join(user_path, txt_fn), 'a')
 
@@ -185,8 +395,6 @@ class AMG_Tester():
             fill_char = click.style('=', fg='yellow')
             with click.progressbar(range(len(self.epochs)), label='Retraining models...', fill_char=fill_char) as bar:
                 for epoch, ba in zip(self.epochs, bar):
-
-
                     if epoch == 0:
                         f1_list = list()
                         txt_file.write('---------------------------------')
@@ -194,13 +402,18 @@ class AMG_Tester():
                         #initial evaluation
                         # re train models and evaluate
                         for mod_fn in mod_list:
-                            mod = joblib.load(mod_fn)
+                            if mod_fn.find('classifier_cnn') > 0:
+                                est_array, gt_array = self.predict_cnn(mod_fn, test_loader)
+                                cl_re = classification_report(np.argmax(gt_array, axis=1), np.argmax(est_array, axis=1))
+                                f1_list.append(f1_score(np.argmax(gt_array, axis=1), np.argmax(est_array, axis=1), average='weighted'))
+                            else:
+                                mod = joblib.load(mod_fn)
+                                this_mod_pred = mod.predict(X_test.values)
+                                cl_re = classification_report(y_test_enc.values, this_mod_pred)
+                                f1_list.append(f1_score(y_test_enc.values, this_mod_pred, average='weighted'))
                             # test using testing data
                             txt_file.write('Model: {}\n'.format(mod_fn))
-                            this_mod_pred = mod.predict(X_test.values)
-                            cl_re = classification_report(y_test_enc.values, this_mod_pred)
                             txt_file.write('{}\n'.format(cl_re))
-                            f1_list.append(f1_score(y_test_enc.values, this_mod_pred, average='weighted'))
 
                         txt_file.write('**\nSummary: F1 mean score over all classifiers = {}\n**\n'.format(np.mean(f1_list)))
 
@@ -213,11 +426,15 @@ class AMG_Tester():
                         # machine disagreement-based consensus entropy
                         pred_prob = []
                         for i, mod_fn in enumerate(mod_list):
-                            # print('Predicting probabilities for model {} ({}/{})'.format(mod_fn, i, len(self.mod_list)))
-                            mod = joblib.load(mod_fn)
-                            y_probs = mod.predict_proba(X_train.values)
-                            # summarize with mean across all samples
-                            y_probs = pd.DataFrame(y_probs, index=X_train.index).groupby(['s_id']).mean()
+                            if mod_fn.find('classifier_cnn') > 0:
+                                est_array, gt_array = self.predict_cnn(mod_fn, train_loader)
+                                y_probs = pd.DataFrame(est_array, index=id_tr.index)
+                                y_probs.index.name = 's_id'
+                            else:
+                                mod = joblib.load(mod_fn)
+                                y_probs = mod.predict_proba(X_train.values)
+                                # summarize with mean across all samples
+                                y_probs = pd.DataFrame(y_probs, index=X_train.index).groupby(['s_id']).mean()
                             pred_prob.append(y_probs)
                             gc.collect()
                     
@@ -241,11 +458,15 @@ class AMG_Tester():
                         # machine disagreement-based consensus entropy
                         pred_prob = []
                         for i, mod_fn in enumerate(mod_list):
-                            # print('Predicting probabilities for model {} ({}/{})'.format(mod_fn, i, len(self.mod_list)))
-                            mod = joblib.load(mod_fn)
-                            y_probs = mod.predict_proba(X_train.values)
-                            # summarize with mean across all samples
-                            y_probs = pd.DataFrame(y_probs, index=X_train.index).groupby(['s_id']).mean()
+                            if mod_fn.find('classifier_cnn') > 0:
+                                est_array, gt_array = self.predict_cnn(mod_fn, train_loader)
+                                y_probs = pd.DataFrame(est_array, index=id_tr.index)
+                                y_probs.index.name = 's_id'                   
+                            else:
+                                mod = joblib.load(mod_fn)
+                                y_probs = mod.predict_proba(X_train.values)
+                                # summarize with mean across all samples
+                                y_probs = pd.DataFrame(y_probs, index=X_train.index).groupby(['s_id']).mean()
                             pred_prob.append(y_probs)
                             gc.collect()
                     
@@ -273,27 +494,43 @@ class AMG_Tester():
                     f1_list = list()
                     # re train models and evaluate
                     for mod_fn in mod_list:
-
-                        mod = joblib.load(mod_fn)
-                        mod_type = mod_fn.split('/')[-1].split('.')[0]
-                        if mod_type == 'classifier_xgb':
-                            mod.fit(X_batch.values, np.squeeze(y_batch_enc.values), xgb_model=mod.get_booster())
-                        elif mod_type == 'classifier_gnb' or mod_type == 'classifier_sgd':
-                            mod.partial_fit(X_batch.values, np.squeeze(y_batch_enc.values))
-                        # save model
-                        joblib.dump(mod, mod_fn)
-                        # test using testing data
+                        if mod_fn.find('classifier_cnn') > 0:
+                            this_batch = id_tr.loc[q_songs]
+                            this_batch.index.name = 'song_id'
+                            est_array, gt_array = self.retrain_cnn(mod_fn, this_batch, test_loader)
+                            cl_re = classification_report(np.argmax(gt_array, axis=1), np.argmax(est_array, axis=1))
+                            f1_list.append(f1_score(np.argmax(gt_array, axis=1), np.argmax(est_array, axis=1), average='weighted'))
+                        else:
+                            mod = joblib.load(mod_fn)
+                            mod_type = mod_fn.split('/')[-1].split('.')[0]
+                            if mod_type == 'classifier_xgb':
+                                mod.fit(X_batch.values, np.squeeze(y_batch_enc.values), xgb_model=mod.get_booster())
+                            elif mod_type == 'classifier_gnb' or mod_type == 'classifier_sgd':
+                                mod.partial_fit(X_batch.values, np.squeeze(y_batch_enc.values))
+                            # save model
+                            joblib.dump(mod, mod_fn)
+                            # test using testing data
+                            this_mod_pred = mod.predict(X_test.values)
+                            cl_re = classification_report(y_test_enc.values, this_mod_pred)
+                            f1_list.append(f1_score(y_test_enc.values, this_mod_pred, average='weighted'))
                         txt_file.write('Model: {}\n'.format(mod_fn))
-                        this_mod_pred = mod.predict(X_test.values)
-                        # pdb.set_trace()
-                        cl_re = classification_report(y_test_enc.values, this_mod_pred)
                         txt_file.write('{}\n'.format(cl_re))
-                        f1_list.append(f1_score(y_test_enc.values, this_mod_pred, average='weighted'))
-
                     txt_file.write('**\nSummary: F1 mean score over all classifiers = {}\n**\n'.format(np.mean(f1_list)))
-                    print(q_songs, X_batch.shape[0])
+                    
                     # remove batch from pool
                     X_train = X_train.drop(X_batch.index)
+                    # remove songs from batch for cnn for training set
+                    id_tr = id_tr[~id_tr.index.isin(q_songs)]
+                    id_tr.index.name = 'song_id'
+                    id_tr.rename(columns={'quadrant': 'quadrants'}, inplace=True)
+                    # update training data loader
+                    train_loader = get_audio_loader(amg_npy,
+                                                    batch_size=1,
+                                                    split=id_tr,
+                                                    input_length=input_length,
+                                                    num_workers=1)
+                    print(q_songs, X_batch.shape[0])
+                    print(train_loader.__len__())
                     gc.collect()
                     txt_file.write('---------------------------------')
 
@@ -304,8 +541,7 @@ class AMG_Tester():
 
 if __name__ == "__main__":
     # Usage
-    # full use: python3 amg_test.py -q 15 -e 10 -m mc
-    # all exp: python3 amg_test.py -q 15 -e 10 -m rand && python3 amg_test.py -q 15 -e 10 -m mc && python3 amg_test.py -q 15 -e 10 -m hc && python3 amg_test.py -q 15 -e 10 -m mix
+    # example: python3 amg_test.py -q 10 -e 10 -m mc -n 150
     parser = argparse.ArgumentParser()
 
     parser.add_argument('-q',
