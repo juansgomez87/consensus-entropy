@@ -33,7 +33,7 @@ We also use [short-chunk CNN](https://github.com/minzwon/sota-music-tagging-mode
 
 The DEAM dataset is available in [this link](https://cvml.unige.ch/databases/DEAM/). We already provide discretized annotations in the `deam_annotations` directory. 
 
-*To be completed with access to data!* 
+*Regarding the AMG1608 dataset, please contact affige[at]gmaildotcom* 
 
 
 ## Usage
