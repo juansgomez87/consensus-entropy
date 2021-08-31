@@ -35,7 +35,6 @@ The DEAM dataset is available in [this link](https://cvml.unige.ch/databases/DEA
 
 *Regarding the AMG1608 dataset, please contact affige[at]gmaildotcom* 
 
-
 ## Usage
 
 ### Pre-trained models
